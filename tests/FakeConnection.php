@@ -10,7 +10,7 @@ final class FakeConnection implements Connection
     /** @var list<array{function: string, input: array<mixed>}> */
     public array $calls = [];
 
-    /** @var array<string, string> "METHOD /path" => response body */
+    /** @var array<string, string> "METHOD /path" or a plugin function like "voice.tracks" => response body */
     public array $responses = [];
 
     /** @var array<string, \Closure(string): void> */
@@ -29,7 +29,7 @@ final class FakeConnection implements Connection
     {
         $request = $this->record($function, $input);
         if ($function !== 'rest') {
-            return '';
+            return $this->responses[$function] ?? '';
         }
 
         $method = is_string($request['method'] ?? null) ? $request['method'] : '';

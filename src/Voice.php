@@ -22,7 +22,7 @@ final class Voice
         return $this;
     }
 
-    /** Plays a URL (a radio stream, an MP3, an Ogg file) in place of what plays now. */
+    /** Plays a URL (a radio stream, an MP3, an Ogg file) at once, in place of what plays and what is queued. */
     public function play(string $url): self
     {
         $this->send('play', ['url' => $url]);
@@ -30,6 +30,50 @@ final class Voice
         return $this;
     }
 
+    /** Plays a URL after the tracks already queued, or at once if nothing plays. */
+    public function queue(string $url): self
+    {
+        $this->send('queue', ['url' => $url]);
+
+        return $this;
+    }
+
+    /** Ends the current track; the next one in the queue starts. */
+    public function skip(): self
+    {
+        $this->send('skip', []);
+
+        return $this;
+    }
+
+    /** Pauses the current track. A radio stream keeps arriving meanwhile: mute() suits it better. */
+    public function pause(): self
+    {
+        $this->send('pause', []);
+
+        return $this;
+    }
+
+    public function resume(): self
+    {
+        $this->send('resume', []);
+
+        return $this;
+    }
+
+    /**
+     * The URLs in the queue, the one playing first.
+     *
+     * @return list<string>
+     */
+    public function tracks(): array
+    {
+        $tracks = json_decode($this->send('tracks', []), true, flags: JSON_THROW_ON_ERROR);
+
+        return is_array($tracks) ? array_values(array_filter($tracks, is_string(...))) : [];
+    }
+
+    /** Stops what plays and empties the queue. */
     public function stop(): self
     {
         $this->send('stop', []);
@@ -52,9 +96,10 @@ final class Voice
     }
 
     /** @param array<string, string|bool> $input */
-    private function send(string $function, array $input): void
+    private function send(string $function, array $input): string
     {
         $input['guild'] = $this->guildId;
-        $this->connection->await("voice.$function", json_encode($input, JSON_THROW_ON_ERROR));
+
+        return $this->connection->await("voice.$function", json_encode($input, JSON_THROW_ON_ERROR));
     }
 }

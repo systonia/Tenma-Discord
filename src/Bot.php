@@ -2,7 +2,8 @@
 
 namespace Tenma\Discord;
 
-use Tenma\Discord\Events\{Dispatch, Event, GuildCreated, MemberJoined, MessageCreated, Ready, VoiceStateUpdated};
+use Tenma\Discord\Events\{Dispatch, Event, GuildCreated, MemberJoined, MessageCreated, Ready};
+use Tenma\Discord\Events\{TrackEnded, TrackFailed, TrackStarted, VoiceStateUpdated};
 use Tenma\Discord\Interactions\{Click, Command, Interaction};
 
 /**
@@ -25,6 +26,9 @@ final class Bot
         MessageCreated::TYPE => MessageCreated::class,
         VoiceStateUpdated::TYPE => VoiceStateUpdated::class,
         MemberJoined::TYPE => MemberJoined::class,
+        TrackStarted::TYPE => TrackStarted::class,
+        TrackEnded::TYPE => TrackEnded::class,
+        TrackFailed::TYPE => TrackFailed::class,
     ];
 
     public readonly Rest $rest;

@@ -36,4 +36,12 @@ final class Command extends Interaction
 
         return is_scalar($value) ? (string) $value : null;
     }
+
+    /** An integer option; null when it was not given. */
+    public function integer(string $name): ?int
+    {
+        $value = $this->option($name);
+
+        return is_int($value) ? $value : null;
+    }
 }

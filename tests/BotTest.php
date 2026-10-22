@@ -4,7 +4,7 @@ namespace Tenma\Discord\Tests;
 
 use PHPUnit\Framework\TestCase;
 use Tenma\Discord\{Bot, Button, Embed, Intents, Message, Option};
-use Tenma\Discord\Events\{Dispatch, MessageCreated};
+use Tenma\Discord\Events\{Dispatch, MessageCreated, TrackFailed};
 use Tenma\Discord\Interactions\{Click, Command};
 
 final class BotTest extends TestCase
@@ -246,5 +246,32 @@ final class BotTest extends TestCase
     {
         $this->assertSame(['flags' => 0, 'content' => 'Muted'], new Message('Muted')->toArray());
         $this->assertSame(['flags' => 0, 'embeds' => [], 'components' => []], new Message(embeds: [], buttons: [])->toArray());
+    }
+
+    public function testTrackEventsReachTheirListeners(): void
+    {
+        $failed = null;
+        $this->bot->on(TrackFailed::class, function (TrackFailed $track) use (&$failed) {
+            $failed = $track;
+        });
+        $this->connect();
+
+        $this->connection->emit('TRACK_FAILED', ['guild_id' => 'g1', 'url' => 'https://x/a.mp3', 'error' => 'not found']);
+
+        $this->assertInstanceOf(TrackFailed::class, $failed);
+        $this->assertSame(['g1', 'https://x/a.mp3', 'not found'], [$failed->guildId, $failed->url, $failed->error]);
+    }
+
+    public function testVoiceQueuesAndListsTracks(): void
+    {
+        $this->connection->responses['voice.tracks'] = '["https://x/a.mp3","https://x/b.mp3"]';
+        $voice = $this->bot->voice('g1');
+
+        $voice->queue('https://x/b.mp3');
+
+        $this->assertSame(['https://x/a.mp3', 'https://x/b.mp3'], $voice->tracks());
+        $calls = array_slice($this->connection->calls, -2);
+        $this->assertSame(['voice.queue', 'voice.tracks'], array_column($calls, 'function'));
+        $this->assertSame(['url' => 'https://x/b.mp3', 'guild' => 'g1'], $calls[0]['input']);
     }
 }

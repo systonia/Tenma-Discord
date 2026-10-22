@@ -13,6 +13,7 @@ use serde::Deserialize;
 use songbird::{EventContext, EventHandler, Songbird, TrackEvent};
 use songbird::input::HttpRequest;
 use songbird::shards::TwilightMap;
+use songbird::tracks::{PlayMode, Track, TrackQueue};
 use tenma_plugin::{LOG_ERROR, LOG_INFO, LOG_WARNING, Plugin, Reply, Token, api};
 use tokio::runtime::Runtime;
 use twilight_gateway::{CloseFrame, Event, EventTypeFlags, Intents, Message, MessageSender, Shard, ShardId};
@@ -270,6 +271,11 @@ extern "C" fn call_async(
             b"rest" => rest(&input).await,
             b"voice.join" => voice_join(&input).await,
             b"voice.play" => voice_play(&input).await,
+            b"voice.queue" => voice_queue(&input).await,
+            b"voice.skip" => voice_skip(&input).await,
+            b"voice.pause" => voice_pause(&input, true).await,
+            b"voice.resume" => voice_pause(&input, false).await,
+            b"voice.tracks" => voice_tracks(&input).await,
             b"voice.stop" => voice_stop(&input).await,
             b"voice.mute" => voice_mute(&input).await,
             b"voice.leave" => voice_leave(&input).await,
@@ -344,25 +350,83 @@ async fn voice_join(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(Vec::new())
 }
 
+/// Plays a URL at once: the queue is emptied first.
 async fn voice_play(input: &[u8]) -> Result<Vec<u8>, String> {
+    enqueue(input, true).await
+}
+
+/// Plays a URL after the tracks already queued.
+async fn voice_queue(input: &[u8]) -> Result<Vec<u8>, String> {
+    enqueue(input, false).await
+}
+
+async fn enqueue(input: &[u8], replace: bool) -> Result<Vec<u8>, String> {
     let (voice, songbird) = voice(input)?;
     let url = voice.url.ok_or("voice.play needs a url")?;
-    let call = songbird.get(id(&voice.guild)?).ok_or("not in a voice channel of this guild")?;
+    let guild = id(&voice.guild)?;
+    let call = songbird.get(guild).ok_or("not in a voice channel of this guild")?;
     let http = BOT.get().expect("started").http.clone();
 
+    let input = HttpRequest::new(http, url.clone()).into();
+    let track = Track::new_with_data(input, Arc::new(url));
+
     let mut call = call.lock().await;
-    call.stop();
-    let track = call.play_input(HttpRequest::new(http, url).into());
-    let _ = track.add_event(TrackEvent::Error.into(), TrackFailed);
+    if replace {
+        call.queue().stop();
+    }
+    let handle = call.enqueue(track).await;
+
+    let announce = Announce {
+        guild,
+        started: Arc::new(AtomicBool::new(false)),
+        finished: Arc::new(AtomicBool::new(false)),
+    };
+    for event in [TrackEvent::Playable, TrackEvent::Play, TrackEvent::End, TrackEvent::Error] {
+        let _ = handle.add_event(event.into(), announce.clone());
+    }
     Ok(Vec::new())
 }
 
-async fn voice_stop(input: &[u8]) -> Result<Vec<u8>, String> {
+/// Runs a function on the queue of the guild's call; nothing happens outside a voice channel.
+async fn with_queue(input: &[u8], action: impl FnOnce(&TrackQueue)) -> Result<Vec<u8>, String> {
     let (voice, songbird) = voice(input)?;
     if let Some(call) = songbird.get(id(&voice.guild)?) {
-        call.lock().await.stop();
+        action(call.lock().await.queue());
     }
     Ok(Vec::new())
+}
+
+async fn voice_skip(input: &[u8]) -> Result<Vec<u8>, String> {
+    with_queue(input, |queue| {
+        let _ = queue.skip();
+    })
+    .await
+}
+
+async fn voice_pause(input: &[u8], pause: bool) -> Result<Vec<u8>, String> {
+    with_queue(input, |queue| {
+        let _ = if pause { queue.pause() } else { queue.resume() };
+    })
+    .await
+}
+
+/// The URLs in the queue as a JSON list, the one playing first.
+async fn voice_tracks(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (voice, songbird) = voice(input)?;
+    let Some(call) = songbird.get(id(&voice.guild)?) else {
+        return Ok(b"[]".to_vec());
+    };
+    let tracks = call.lock().await.queue().current_queue();
+    let urls: Vec<String> = tracks
+        .iter()
+        .map(|track| track.data::<String>().to_string())
+        .collect();
+    serde_json::to_vec(&urls).map_err(|error| error.to_string())
+}
+
+/// Stops what plays and empties the queue.
+async fn voice_stop(input: &[u8]) -> Result<Vec<u8>, String> {
+    with_queue(input, |queue| queue.stop()).await
 }
 
 /// Mutes the bot in its voice channel: the stream keeps running, nothing is sent, Discord shows it muted.
@@ -374,15 +438,48 @@ async fn voice_mute(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(Vec::new())
 }
 
-/// Logs why a track stopped playing: an unreachable URL, a format nobody can decode.
-struct TrackFailed;
+/// Tells PHP when a track starts, ends or fails, as TRACK_STARTED, TRACK_ENDED and TRACK_FAILED
+/// dispatches to the guild's worker. Each happens once per track, though songbird fires Play again
+/// after a pause and End after an error.
+#[derive(Clone)]
+struct Announce {
+    guild: NonZeroU64,
+    started: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Announce {
+    fn post(&self, kind: &str, url: &str, error: Option<String>) {
+        let dispatch = serde_json::json!({
+            "op": 0,
+            "t": kind,
+            "d": { "guild_id": self.guild.to_string(), "url": url, "error": error },
+        });
+        route(&dispatch.to_string());
+    }
+}
 
 #[async_trait::async_trait]
-impl EventHandler for TrackFailed {
+impl EventHandler for Announce {
     async fn act(&self, context: &EventContext<'_>) -> Option<songbird::Event> {
-        if let EventContext::Track(tracks) = context {
-            for (state, _) in *tracks {
-                api().log(LOG_WARNING, &format!("discord voice: {:?}", state.playing));
+        let EventContext::Track(tracks) = context else {
+            return None;
+        };
+        for (state, track) in *tracks {
+            let url = track.data::<String>();
+            match &state.playing {
+                // A queued track waits paused: it starts when the queue moves it to Play
+                PlayMode::Play if !self.started.swap(true, Ordering::Relaxed) => {
+                    self.post("TRACK_STARTED", &url, None);
+                }
+                PlayMode::Errored(error) if !self.finished.swap(true, Ordering::Relaxed) => {
+                    api().log(LOG_WARNING, &format!("discord voice: {url}: {error}"));
+                    self.post("TRACK_FAILED", &url, Some(error.to_string()));
+                }
+                PlayMode::End | PlayMode::Stop if !self.finished.swap(true, Ordering::Relaxed) => {
+                    self.post("TRACK_ENDED", &url, None);
+                }
+                _ => {}
             }
         }
         None

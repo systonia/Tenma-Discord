@@ -1,12 +1,12 @@
 <?php
 
-// A radio bot: /radio plays a station in your voice channel, buttons mute it or leave.
+// A radio bot: /radio plays a station in your voice channel, /play queues songs, buttons mute it or leave.
 // Run: DISCORD_TOKEN=... tenma --plugin plugin/target/release/libtenma_discord.dylib examples/radio.php
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Tenma\Discord\{Bot, Button, ButtonStyle, Embed, Message, Option};
-use Tenma\Discord\Events\Ready;
+use Tenma\Discord\{Bot, Button, ButtonStyle, Embed, Message, Option, Voice};
+use Tenma\Discord\Events\{Ready, TrackFailed, TrackStarted};
 use Tenma\Discord\Interactions\{Click, Command};
 
 const STATION = 'https://listen.moe/stream';
@@ -17,20 +17,39 @@ $bot->on(Ready::class, function (Ready $ready) {
     echo "online as {$ready->user->name}\n";
 });
 
+$bot->on(TrackStarted::class, function (TrackStarted $track) {
+    echo "playing {$track->url}\n";
+});
+
+$bot->on(TrackFailed::class, function (TrackFailed $track) {
+    echo "failed {$track->url}: {$track->error}\n";
+});
+
 $bot->command('ping', 'Answers with pong', fn (Command $command) => 'pong');
+
+// Joins the voice channel of whoever ran the command; null when they sit in none
+$join = function (Command $command) use ($bot): ?Voice {
+    if ($command->voiceChannel === null || $command->guildId === null) {
+        return null;
+    }
+
+    // Joining takes longer than the 3 seconds Discord waits
+    $command->defer();
+
+    return $bot->voice($command->guildId)->join($command->voiceChannel);
+};
 
 $bot->command(
     'radio',
     'Plays a radio station in your voice channel',
-    function (Command $command) use ($bot) {
-        if ($command->voiceChannel === null || $command->guildId === null) {
+    function (Command $command) use ($join) {
+        $voice = $join($command);
+        if ($voice === null) {
             return new Message('Join a voice channel first.', ephemeral: true);
         }
 
-        // Joining takes longer than the 3 seconds Discord waits
-        $command->defer();
         $url = $command->string('url') ?? STATION;
-        $bot->voice($command->guildId)->join($command->voiceChannel)->play($url);
+        $voice->play($url);
 
         $nowPlaying = new Embed(title: 'On air', description: $url, color: 0xE91E63);
         $buttons = [
@@ -42,6 +61,34 @@ $bot->command(
     },
     [Option::string('url', 'Stream URL, listen.moe if empty')],
 );
+
+$bot->command(
+    'play',
+    'Queues a song (an MP3 or Ogg URL)',
+    function (Command $command) use ($join) {
+        $voice = $join($command);
+        if ($voice === null) {
+            return new Message('Join a voice channel first.', ephemeral: true);
+        }
+
+        $voice->queue((string) $command->string('url'));
+
+        return 'Queued, ' . count($voice->tracks()) . ' in the queue';
+    },
+    [Option::string('url', 'Song URL', required: true)],
+);
+
+$bot->command('skip', 'Skips the current song', function (Command $command) use ($bot) {
+    $bot->voice((string) $command->guildId)->skip();
+
+    return new Message('Skipped', ephemeral: true);
+});
+
+$bot->command('queue', 'Lists the queue', function (Command $command) use ($bot) {
+    $tracks = $bot->voice((string) $command->guildId)->tracks();
+
+    return new Message($tracks === [] ? 'The queue is empty' : implode("\n", $tracks), ephemeral: true);
+});
 
 // The button's id says what it does next: mute:on mutes, mute:off unmutes, and the button flips
 $bot->button('mute', function (Click $click) use ($bot) {
