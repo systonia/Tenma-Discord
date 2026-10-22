@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -12,13 +15,12 @@ use songbird::input::HttpRequest;
 use songbird::shards::TwilightMap;
 use tenma_plugin::{LOG_ERROR, LOG_INFO, LOG_WARNING, Plugin, Reply, Token, api};
 use tokio::runtime::Runtime;
-use twilight_gateway::{Event, EventTypeFlags, Intents, Message, MessageSender, Shard, ShardId};
+use twilight_gateway::{CloseFrame, Event, EventTypeFlags, Intents, Message, MessageSender, Shard, ShardId};
 use twilight_model::gateway::payload::outgoing::UpdateVoiceState;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, GuildMarker};
 
 const API: &str = "https://discord.com/api/v10";
-const EVENTS: &str = "discord.events";
 
 static PLUGIN: Plugin = Plugin {
     name: c"discord".as_ptr(),
@@ -27,11 +29,14 @@ static PLUGIN: Plugin = Plugin {
     adopt: None,
     message: None,
     closed: None,
-    shutdown: None,
+    shutdown: Some(shutdown),
 };
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static BOT: OnceLock<Bot> = OnceLock::new();
+/// The workers that asked for events, by the thread they run on; an event goes to one of them.
+static WORKERS: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
+static STOPPING: AtomicBool = AtomicBool::new(false);
 
 struct Bot {
     token: String,
@@ -74,11 +79,15 @@ extern "C" fn call(
         )
     };
     let result = match function {
-        b"start" => start(input),
+        b"start" => start(input).map(|()| String::new()),
+        b"register" => Ok(register()),
         _ => Err(format!("unknown function {}", String::from_utf8_lossy(function))),
     };
     match result {
-        Ok(()) => 0,
+        Ok(reply) => {
+            api().reply(out, reply.as_bytes());
+            0
+        }
         Err(message) => {
             api().reply(out, message.as_bytes());
             1
@@ -107,9 +116,70 @@ fn start(input: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// The channel this worker receives its events on. A call runs on the worker's own thread, so the
+/// thread tells workers apart; a worker that registers again keeps its channel.
+fn register() -> String {
+    let thread = std::thread::current().id();
+    let mut workers = WORKERS.lock().expect("workers");
+    let index = match workers.iter().position(|known| *known == thread) {
+        Some(index) => index,
+        None => {
+            workers.push(thread);
+            workers.len() - 1
+        }
+    };
+    channel(index)
+}
+
+fn channel(worker: usize) -> String {
+    format!("discord.w{worker}")
+}
+
 #[derive(Deserialize)]
-struct Op {
+struct Dispatch {
     op: u8,
+    t: Option<String>,
+    d: Option<Keys>,
+}
+
+#[derive(Deserialize)]
+struct Keys {
+    guild_id: Option<String>,
+    channel_id: Option<String>,
+    id: Option<String>,
+}
+
+/// Sends a dispatch to the worker that owns its guild (or its channel, for direct messages), so the
+/// events of one guild stay in order on one worker. Events of no guild, like READY, reach every worker.
+fn route(text: &str) {
+    let Ok(dispatch) = serde_json::from_str::<Dispatch>(text) else {
+        return;
+    };
+    // Only dispatches go to PHP, not heartbeat acks and the like
+    if dispatch.op != 0 {
+        return;
+    }
+    let workers = WORKERS.lock().expect("workers").len();
+    if workers == 0 {
+        return;
+    }
+
+    let keys = dispatch.d;
+    let guild_event = matches!(dispatch.t.as_deref(), Some("GUILD_CREATE" | "GUILD_UPDATE" | "GUILD_DELETE"));
+    let key = keys.and_then(|keys| {
+        keys.guild_id
+            .or(if guild_event { keys.id } else { None })
+            .or(keys.channel_id)
+    });
+
+    match key.and_then(|key| key.parse::<u64>().ok()) {
+        Some(key) => api().post(&channel((key % workers as u64) as usize), text.as_bytes()),
+        None => {
+            for worker in 0..workers {
+                api().post(&channel(worker), text.as_bytes());
+            }
+        }
+    }
 }
 
 async fn gateway(token: String, intents: Intents) {
@@ -123,6 +193,7 @@ async fn gateway(token: String, intents: Intents) {
     while let Some(message) = shard.next().await {
         let text = match message {
             Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) if STOPPING.load(Ordering::Relaxed) => break,
             Ok(Message::Close(frame)) => {
                 api().log(LOG_WARNING, &format!("discord gateway closed: {frame:?}"));
                 continue;
@@ -146,12 +217,34 @@ async fn gateway(token: String, intents: Intents) {
             }
         }
 
-        // Only dispatches go to PHP, not heartbeat acks and the like
-        if serde_json::from_str::<Op>(&text).is_ok_and(|op| op.op == 0) {
-            api().post(EVENTS, text.as_bytes());
-        }
+        route(&text);
+    }
+    if STOPPING.load(Ordering::Relaxed) {
+        return;
     }
     api().log(LOG_ERROR, "discord gateway: gave up, the token or the intents were refused");
+}
+
+/// Leaves every voice channel and closes the gateway, so the bot goes offline at once instead of
+/// after Discord's timeout. Bounded, since tenma waits for it.
+extern "C" fn shutdown() {
+    let (Some(runtime), Some(bot)) = (RUNTIME.get(), BOT.get()) else {
+        return;
+    };
+    STOPPING.store(true, Ordering::Relaxed);
+    let leave = async {
+        if let Some(voice) = bot.voice.get() {
+            for (guild, _) in voice.iter().collect::<Vec<_>>() {
+                let _ = voice.remove(guild).await;
+            }
+        }
+        if let Some(gateway) = bot.gateway.get() {
+            let _ = gateway.close(CloseFrame::NORMAL);
+        }
+    };
+    runtime.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_secs(3), leave).await;
+    });
 }
 
 extern "C" fn call_async(

@@ -2,7 +2,9 @@
 
 // Spike: /ping answers, /radio joins your voice channel and plays a station, /stop leaves.
 // Run: tenma --plugin plugin/target/release/libtenma_discord.dylib spike/bot.php
+// With PORT set it also serves /health, and runs on as many workers as --workers says.
 
+use Http\{Request, Server};
 use Messaging\Channel;
 use Tenma\Plugin;
 
@@ -42,9 +44,14 @@ $application = null;
 // guild => user => voice channel, from GUILD_CREATE and VOICE_STATE_UPDATE
 $voiceChannels = [];
 
-new Channel('discord.events')->subscribe(function (string $payload) use ($commands, &$application, &$voiceChannels) {
+// Each worker gets the events of its share of the guilds on a channel of its own
+$events = Plugin::call('discord', 'register', '');
+$worker = substr($events, strlen('discord.w'));
+
+new Channel($events)->subscribe(function (string $payload) use ($commands, $worker, &$application, &$voiceChannels) {
     $event = json_decode($payload, true);
     $data = $event['d'];
+    echo "worker $worker: {$event['t']}\n";
 
     switch ($event['t']) {
         case 'READY':
@@ -103,3 +110,8 @@ function interaction(array $data, string $application, array $voiceChannels): vo
 }
 
 Plugin::call('discord', 'start', json_encode(['token' => $token, 'intents' => GUILDS | GUILD_VOICE_STATES]));
+
+$port = getenv('PORT');
+if ($port !== false) {
+    new Server((int) $port, fn (Request $request) => 'ok')->start();
+}
