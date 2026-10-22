@@ -270,6 +270,8 @@ extern "C" fn call_async(
             b"rest" => rest(&input).await,
             b"voice.join" => voice_join(&input).await,
             b"voice.play" => voice_play(&input).await,
+            b"voice.stop" => voice_stop(&input).await,
+            b"voice.mute" => voice_mute(&input).await,
             b"voice.leave" => voice_leave(&input).await,
             _ => Err(format!("unknown function {}", String::from_utf8_lossy(&function))),
         };
@@ -316,6 +318,7 @@ struct Voice {
     guild: String,
     channel: Option<String>,
     url: Option<String>,
+    muted: Option<bool>,
 }
 
 fn voice(input: &[u8]) -> Result<(Voice, Arc<Songbird>), String> {
@@ -351,6 +354,23 @@ async fn voice_play(input: &[u8]) -> Result<Vec<u8>, String> {
     call.stop();
     let track = call.play_input(HttpRequest::new(http, url).into());
     let _ = track.add_event(TrackEvent::Error.into(), TrackFailed);
+    Ok(Vec::new())
+}
+
+async fn voice_stop(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (voice, songbird) = voice(input)?;
+    if let Some(call) = songbird.get(id(&voice.guild)?) {
+        call.lock().await.stop();
+    }
+    Ok(Vec::new())
+}
+
+/// Mutes the bot in its voice channel: the stream keeps running, nothing is sent, Discord shows it muted.
+async fn voice_mute(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (voice, songbird) = voice(input)?;
+    let call = songbird.get(id(&voice.guild)?).ok_or("not in a voice channel of this guild")?;
+    let muted = voice.muted.unwrap_or(true);
+    call.lock().await.mute(muted).await.map_err(|error| error.to_string())?;
     Ok(Vec::new())
 }
 

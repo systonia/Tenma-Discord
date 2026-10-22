@@ -1,0 +1,31 @@
+{
+    "name": "tenma/discord",
+    "description": "Discord bots in PHP on Tenma: gateway events, slash commands, buttons and voice through a native plugin.",
+    "type": "library",
+    "license": [
+        "MIT",
+        "Apache-2.0"
+    ],
+    "require": {
+        "php": ">=8.5"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.2",
+        "phpunit/phpunit": "^13.3",
+        "tenma/stubs": "^0.2.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Tenma\\Discord\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tenma\\Discord\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit --testdox",
+        "stan": "phpstan analyse"
+    }
+}

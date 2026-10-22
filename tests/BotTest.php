@@ -1,0 +1,250 @@
+<?php
+
+namespace Tenma\Discord\Tests;
+
+use PHPUnit\Framework\TestCase;
+use Tenma\Discord\{Bot, Button, Embed, Intents, Message, Option};
+use Tenma\Discord\Events\{Dispatch, MessageCreated};
+use Tenma\Discord\Interactions\{Click, Command};
+
+final class BotTest extends TestCase
+{
+    private FakeConnection $connection;
+    private Bot $bot;
+
+    protected function setUp(): void
+    {
+        $this->connection = new FakeConnection();
+        $this->bot = new Bot('secret', Intents::Default, $this->connection);
+    }
+
+    private function connect(): void
+    {
+        $this->bot->start();
+        $this->connection->emit('READY', [
+            'user' => ['id' => '1', 'username' => 'tenma', 'bot' => true],
+            'application' => ['id' => 'app'],
+        ]);
+    }
+
+    /**
+     * @param array<mixed> $data
+     * @return array<mixed>
+     */
+    private static function interaction(int $type, array $data, string $user = 'u1'): array
+    {
+        return [
+            'id' => 'i1',
+            'token' => 't1',
+            'type' => $type,
+            'guild_id' => 'g1',
+            'channel_id' => 'c1',
+            'member' => ['user' => ['id' => $user, 'username' => 'lento']],
+            'data' => $data,
+            'message' => ['id' => 'm1'],
+        ];
+    }
+
+    /** @return list<array<mixed>> */
+    private function callbacks(): array
+    {
+        return $this->connection->rest('POST', '/interactions/i1/t1/callback');
+    }
+
+    /** @return array<mixed> the data of the first interaction callback */
+    private function callbackData(): array
+    {
+        $data = $this->callbacks()[0]['data'] ?? null;
+
+        return is_array($data) ? $data : [];
+    }
+
+    public function testStartRegistersSubscribesAndConnectsWithTheToken(): void
+    {
+        $this->bot->start();
+
+        $functions = array_column($this->connection->calls, 'function');
+        $this->assertSame(['register', 'start'], $functions);
+        $this->assertSame(['token' => 'secret', 'intents' => Intents::Default], $this->connection->calls[1]['input']);
+    }
+
+    public function testReadySyncsCommandsDiscordDoesNotKnowYet(): void
+    {
+        $this->bot->command('ping', 'Answers with pong', fn (Command $command) => 'pong');
+
+        $this->connect();
+
+        $put = $this->connection->rest('PUT', '/applications/app/commands');
+        $this->assertSame([[['name' => 'ping', 'description' => 'Answers with pong', 'options' => []]]], $put);
+    }
+
+    public function testReadyLeavesCommandsAloneThatDiscordAlreadyHas(): void
+    {
+        $this->bot->command('radio', 'Plays', fn (Command $command) => null, [Option::string('url', 'Stream')]);
+        $this->connection->responses['GET /applications/app/commands'] = json_encode([[
+            'id' => '9',
+            'name' => 'radio',
+            'description' => 'Plays',
+            'options' => [['type' => 3, 'name' => 'url', 'description' => 'Stream']],
+        ]], JSON_THROW_ON_ERROR);
+
+        $this->connect();
+
+        $this->assertSame([], $this->connection->rest('PUT', '/applications/app/commands'));
+    }
+
+    public function testOnlyTheFirstWorkerSyncsCommands(): void
+    {
+        $connection = new FakeConnection('discord.w2');
+        $bot = new Bot('secret', Intents::Default, $connection);
+        $bot->command('ping', 'Answers with pong', fn (Command $command) => 'pong');
+
+        $bot->start();
+        $connection->emit('READY', ['user' => ['id' => '1', 'username' => 'tenma'], 'application' => ['id' => 'app']]);
+
+        $this->assertSame([], $connection->rest('GET', '/applications/app/commands'));
+    }
+
+    public function testAReturnedStringIsTheReply(): void
+    {
+        $this->bot->command('ping', 'Answers with pong', fn (Command $command) => 'pong');
+        $this->connect();
+
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(2, ['name' => 'ping']));
+
+        $this->assertSame(4, $this->callbacks()[0]['type']);
+        $this->assertSame('pong', $this->callbackData()['content'] ?? null);
+    }
+
+    public function testAReplyAfterDeferReplacesTheThinkingMessage(): void
+    {
+        $this->bot->command('slow', 'Takes a while', function (Command $command) {
+            $command->defer();
+            return 'done';
+        });
+        $this->connect();
+
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(2, ['name' => 'slow']));
+
+        $this->assertSame([5], array_column($this->callbacks(), 'type'));
+        $edits = $this->connection->rest('PATCH', '/webhooks/app/t1/messages/@original');
+        $this->assertSame('done', $edits[0]['content']);
+    }
+
+    public function testCommandOptionsReachTheHandler(): void
+    {
+        $seen = null;
+        $this->bot->command('radio', 'Plays', function (Command $command) use (&$seen) {
+            $seen = [$command->string('url'), $command->option('missing')];
+            return null;
+        });
+        $this->connect();
+
+        $data = ['name' => 'radio', 'options' => [['name' => 'url', 'type' => 3, 'value' => 'https://listen.moe/stream']]];
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(2, $data));
+
+        $this->assertSame(['https://listen.moe/stream', null], $seen);
+        $this->assertSame([], $this->callbacks());
+    }
+
+    public function testTheBotKnowsWhichVoiceChannelAUserSitsIn(): void
+    {
+        $voiceChannel = 'unset';
+        $this->bot->command('radio', 'Plays', function (Command $command) use (&$voiceChannel) {
+            $voiceChannel = $command->voiceChannel;
+            return null;
+        });
+        $this->connect();
+
+        $this->connection->emit('GUILD_CREATE', [
+            'id' => 'g1',
+            'name' => 'Guild',
+            'voice_states' => [['user_id' => 'u1', 'channel_id' => 'v1']],
+        ]);
+        $this->connection->emit('VOICE_STATE_UPDATE', ['guild_id' => 'g1', 'user_id' => 'u1', 'channel_id' => 'v2']);
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(2, ['name' => 'radio']));
+        $this->assertSame('v2', $voiceChannel);
+
+        $this->connection->emit('VOICE_STATE_UPDATE', ['guild_id' => 'g1', 'user_id' => 'u1', 'channel_id' => null]);
+        $this->assertNull($this->bot->voiceChannel('g1', 'u1'));
+    }
+
+    public function testAButtonIdWithAColonReachesTheHandlerOfItsPrefix(): void
+    {
+        $clicked = null;
+        $this->bot->button('vote', function (Click $click) use (&$clicked) {
+            $clicked = $click->buttonId;
+            $click->update('Thanks');
+            return null;
+        });
+        $this->connect();
+
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(3, ['custom_id' => 'vote:42']));
+
+        $this->assertSame('vote:42', $clicked);
+        $this->assertSame(7, $this->callbacks()[0]['type']);
+    }
+
+    public function testAFailingHandlerTellsTheUserAndStillThrows(): void
+    {
+        $this->bot->command('broken', 'Fails', fn (Command $command) => throw new \RuntimeException('boom'));
+        $this->connect();
+
+        try {
+            $this->connection->emit('INTERACTION_CREATE', self::interaction(2, ['name' => 'broken']));
+            $this->fail('The error was swallowed');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('boom', $error->getMessage());
+        }
+
+        $this->assertSame(1 << 6, $this->callbackData()['flags'] ?? null);
+    }
+
+    public function testEventsArriveAsTheirClassAndAsDispatch(): void
+    {
+        $messages = [];
+        $types = [];
+        $this->bot->on(MessageCreated::class, function (MessageCreated $message) use (&$messages) {
+            $messages[] = "{$message->author->name}: {$message->content}";
+        });
+        $this->bot->on(Dispatch::class, function (Dispatch $dispatch) use (&$types) {
+            $types[] = $dispatch->type;
+        });
+        $this->connect();
+
+        $this->connection->emit('MESSAGE_CREATE', [
+            'id' => 'm1',
+            'channel_id' => 'c1',
+            'author' => ['id' => 'u1', 'username' => 'lento'],
+            'content' => 'hello',
+        ]);
+
+        $this->assertSame(['lento: hello'], $messages);
+        $this->assertSame(['READY', 'MESSAGE_CREATE'], $types);
+    }
+
+    public function testAnUnknownEventClassIsRefused(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->bot->on(UnknownEvent::class, fn (UnknownEvent $event) => null);
+    }
+
+    public function testAMessageCarriesEmbedsAndButtonsFiveToARow(): void
+    {
+        $buttons = array_map(fn (int $i) => new Button("b$i", "B$i"), range(1, 6));
+        $message = new Message('hi', [new Embed(title: 'Title', fields: ['Now' => 'Song'])], $buttons, ephemeral: true);
+
+        $array = $message->toArray();
+
+        $this->assertSame([['title' => 'Title', 'fields' => [['name' => 'Now', 'value' => 'Song', 'inline' => true]]]], $array['embeds']);
+        $this->assertIsArray($array['components']);
+        $this->assertCount(2, $array['components']);
+        $this->assertSame(1 << 6, $array['flags']);
+    }
+
+    public function testAnEditLeavesWhatTheMessageDoesNotSetAndClearsEmptyLists(): void
+    {
+        $this->assertSame(['flags' => 0, 'content' => 'Muted'], new Message('Muted')->toArray());
+        $this->assertSame(['flags' => 0, 'embeds' => [], 'components' => []], new Message(embeds: [], buttons: [])->toArray());
+    }
+}
