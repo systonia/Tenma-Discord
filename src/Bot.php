@@ -4,7 +4,7 @@ namespace Tenma\Discord;
 
 use Tenma\Discord\Events\{Dispatch, Event, GuildCreated, MemberJoined, MessageCreated, Ready};
 use Tenma\Discord\Events\{TrackEnded, TrackFailed, TrackStarted, VoiceStateUpdated};
-use Tenma\Discord\Interactions\{Click, Command, Interaction};
+use Tenma\Discord\Interactions\{Autocomplete, Click, Command, Interaction, Submit};
 
 /**
  * A Discord bot. Register commands, buttons and event handlers, then start():
@@ -38,8 +38,14 @@ final class Bot
     /** @var array<string, array{definition: array<string, mixed>, handler: \Closure}> */
     private array $commands = [];
 
+    /** @var array<string, array<string, \Closure>> command => option => autocomplete handler */
+    private array $autocompletes = [];
+
     /** @var array<string, \Closure> button id => handler */
     private array $buttons = [];
+
+    /** @var array<string, \Closure> modal id => handler */
+    private array $modals = [];
 
     /** @var array<class-string<Event>, list<\Closure>> */
     private array $listeners = [];
@@ -73,6 +79,12 @@ final class Bot
         ];
         $this->commands[$name] = ['definition' => $definition, 'handler' => $handler];
 
+        foreach ($options as $option) {
+            if ($option->autocomplete !== null) {
+                $this->autocompletes[$name][$option->name] = $option->autocomplete;
+            }
+        }
+
         return $this;
     }
 
@@ -88,8 +100,19 @@ final class Bot
     }
 
     /**
-     * A gateway event: Ready, GuildCreated, MessageCreated, VoiceStateUpdated, MemberJoined, or Dispatch for
-     * every event as it came.
+     * Sent modals with this id, or with an id that starts with "$id:", like buttons.
+     * @param \Closure(Submit): (string|Message|null) $handler
+     */
+    public function modal(string $id, \Closure $handler): self
+    {
+        $this->modals[$id] = $handler;
+
+        return $this;
+    }
+
+    /**
+     * A gateway event: Ready, GuildCreated, MessageCreated, VoiceStateUpdated, MemberJoined, the voice
+     * queue's TrackStarted, TrackEnded and TrackFailed, or Dispatch for every event as it came.
      * @template T of Event
      * @param class-string<T> $event
      * @param \Closure(T): mixed $handler
@@ -208,12 +231,16 @@ final class Bot
     {
         $options = [];
         foreach ($command->list('options') as $option) {
-            $options[] = [
+            $known = [
                 'type' => $option->int('type'),
                 'name' => $option->string('name'),
                 'description' => $option->string('description'),
                 'required' => $option->value('required') === true,
             ];
+            if ($option->value('autocomplete') === true) {
+                $known['autocomplete'] = true;
+            }
+            $options[] = $known;
         }
 
         return [
@@ -248,7 +275,13 @@ final class Bot
             $handler = $this->commands[$interaction->name]['handler'] ?? null;
         } elseif ($type === 3) {
             $interaction = new Click($data, $this);
-            $handler = $this->buttonHandler($interaction->buttonId);
+            $handler = self::byId($this->buttons, $interaction->buttonId);
+        } elseif ($type === 4) {
+            $interaction = new Autocomplete($data, $this);
+            $handler = $this->autocompletes[$interaction->command][$interaction->option] ?? null;
+        } elseif ($type === 5) {
+            $interaction = new Submit($data, $this);
+            $handler = self::byId($this->modals, $interaction->modalId);
         } else {
             return;
         }
@@ -259,11 +292,12 @@ final class Bot
         $this->answer($interaction, $handler);
     }
 
-    private function buttonHandler(string $buttonId): ?\Closure
+    /** @param array<string, \Closure> $handlers */
+    private static function byId(array $handlers, string $id): ?\Closure
     {
-        $prefix = strstr($buttonId, ':', true);
+        $prefix = strstr($id, ':', true);
 
-        return $this->buttons[$buttonId] ?? ($prefix === false ? null : $this->buttons[$prefix] ?? null);
+        return $handlers[$id] ?? ($prefix === false ? null : $handlers[$prefix] ?? null);
     }
 
     /** Runs the handler; its return value is the reply. A failure tells the user before it is logged. */
@@ -276,6 +310,10 @@ final class Bot
             throw $error;
         }
 
+        if ($interaction instanceof Autocomplete) {
+            $interaction->suggest(is_array($reply) ? $reply : []);
+            return;
+        }
         if (is_string($reply) || $reply instanceof Message) {
             $interaction->reply($reply);
         }

@@ -2,7 +2,7 @@
 
 namespace Tenma\Discord\Interactions;
 
-use Tenma\Discord\{Bot, Message, Payload, User};
+use Tenma\Discord\{Bot, Message, Modal, Payload, User};
 
 /**
  * A slash command or a click. Discord waits 3 seconds for the first answer: reply() at once, or defer() and
@@ -61,6 +61,12 @@ abstract class Interaction
         }
         $this->respond(5, ['flags' => $ephemeral ? 1 << 6 : 0]);
         $this->deferred = true;
+    }
+
+    /** Opens a form as the answer; only as the first one, so not after defer(). */
+    public function modal(Modal $modal): void
+    {
+        $this->respond(9, $modal->toArray());
     }
 
     /** Another message after the first answer. */

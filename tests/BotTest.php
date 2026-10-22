@@ -3,9 +3,9 @@
 namespace Tenma\Discord\Tests;
 
 use PHPUnit\Framework\TestCase;
-use Tenma\Discord\{Bot, Button, Embed, Intents, Message, Option};
+use Tenma\Discord\{Bot, Button, Embed, Intents, Message, Modal, Option, TextInput};
 use Tenma\Discord\Events\{Dispatch, MessageCreated, TrackFailed};
-use Tenma\Discord\Interactions\{Click, Command};
+use Tenma\Discord\Interactions\{Autocomplete, Click, Command, Submit};
 
 final class BotTest extends TestCase
 {
@@ -273,5 +273,47 @@ final class BotTest extends TestCase
         $calls = array_slice($this->connection->calls, -2);
         $this->assertSame(['voice.queue', 'voice.tracks'], array_column($calls, 'function'));
         $this->assertSame(['url' => 'https://x/b.mp3', 'guild' => 'g1'], $calls[0]['input']);
+    }
+
+    public function testAutocompleteSuggestsWhatTheHandlerReturns(): void
+    {
+        $stations = fn (Autocomplete $typed) => array_filter(
+            ['J-pop' => 'https://listen.moe/stream', 'K-pop' => 'https://listen.moe/kpop/stream'],
+            fn (string $name) => stripos($name, $typed->value) !== false,
+            ARRAY_FILTER_USE_KEY,
+        );
+        $this->bot->command('radio', 'Plays', fn (Command $command) => null, [
+            Option::string('url', 'Stream', autocomplete: $stations),
+        ]);
+        $this->connect();
+
+        $data = ['name' => 'radio', 'options' => [['name' => 'url', 'type' => 3, 'value' => 'k-', 'focused' => true]]];
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(4, $data));
+
+        $option = ['type' => 3, 'name' => 'url', 'description' => 'Stream', 'required' => false, 'autocomplete' => true];
+        $put = $this->connection->rest('PUT', '/applications/app/commands');
+        $this->assertSame([[['name' => 'radio', 'description' => 'Plays', 'options' => [$option]]]], $put);
+        $this->assertSame(8, $this->callbacks()[0]['type']);
+        $this->assertSame([['name' => 'K-pop', 'value' => 'https://listen.moe/kpop/stream']], $this->callbackData()['choices'] ?? null);
+    }
+
+    public function testAModalOpensAndItsAnswerReachesTheModalHandler(): void
+    {
+        $this->bot->command('suggest', 'Suggests a station', function (Command $command) {
+            $command->modal(new Modal('station', 'Suggest a station', [new TextInput('url', 'Stream URL')]));
+            return null;
+        });
+        $this->bot->modal('station', fn (Submit $submit) => "Thanks for {$submit->value('url')}");
+        $this->connect();
+
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(2, ['name' => 'suggest']));
+        $this->connection->emit('INTERACTION_CREATE', self::interaction(5, [
+            'custom_id' => 'station',
+            'components' => [['type' => 18, 'component' => ['type' => 4, 'custom_id' => 'url', 'value' => 'https://x/radio']]],
+        ]));
+
+        $callbacks = $this->callbacks();
+        $this->assertSame([9, 4], array_column($callbacks, 'type'));
+        $this->assertSame(['flags' => 0, 'content' => 'Thanks for https://x/radio'], $callbacks[1]['data']);
     }
 }

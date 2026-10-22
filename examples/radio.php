@@ -5,11 +5,15 @@
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Tenma\Discord\{Bot, Button, ButtonStyle, Embed, Message, Option, Voice};
+use Tenma\Discord\{Bot, Button, ButtonStyle, Embed, Message, Modal, Option, TextInput, Voice};
 use Tenma\Discord\Events\{Ready, TrackFailed, TrackStarted};
-use Tenma\Discord\Interactions\{Click, Command};
+use Tenma\Discord\Interactions\{Autocomplete, Click, Command, Submit};
 
 const STATION = 'https://listen.moe/stream';
+const STATIONS = [
+    'listen.moe J-pop' => 'https://listen.moe/stream',
+    'listen.moe K-pop' => 'https://listen.moe/kpop/stream',
+];
 
 $bot = new Bot(getenv('DISCORD_TOKEN') ?: exit("DISCORD_TOKEN is missing\n"));
 
@@ -59,7 +63,7 @@ $bot->command(
 
         return new Message(embeds: [$nowPlaying], buttons: $buttons);
     },
-    [Option::string('url', 'Stream URL, listen.moe if empty')],
+    [Option::string('url', 'Stream URL, listen.moe if empty', autocomplete: suggestStations(...))],
 );
 
 $bot->command(
@@ -77,6 +81,21 @@ $bot->command(
     },
     [Option::string('url', 'Song URL', required: true)],
 );
+
+// Opens a form; what the user enters arrives at the 'station' modal handler below
+$bot->command('suggest', 'Suggests a station', function (Command $command) {
+    $command->modal(new Modal('station', 'Suggest a station', [
+        new TextInput('name', 'Name', maxLength: 50),
+        new TextInput('url', 'Stream URL', placeholder: 'https://'),
+    ]));
+    return null;
+});
+
+$bot->modal('station', function (Submit $submit) {
+    $station = new Embed(title: (string) $submit->value('name'), description: $submit->value('url'));
+
+    return new Message("{$submit->user->mention()} suggests", embeds: [$station]);
+});
 
 $bot->command('skip', 'Skips the current song', function (Command $command) use ($bot) {
     $bot->voice((string) $command->guildId)->skip();
@@ -113,3 +132,16 @@ $bot->button('leave', function (Click $click) use ($bot) {
 });
 
 $bot->start();
+
+/**
+ * The stations whose name contains what the user typed.
+ * @return array<string, string>
+ */
+function suggestStations(Autocomplete $typed): array
+{
+    return array_filter(
+        STATIONS,
+        fn (string $name) => stripos($name, $typed->value) !== false,
+        ARRAY_FILTER_USE_KEY,
+    );
+}
