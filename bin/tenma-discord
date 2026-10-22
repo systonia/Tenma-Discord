@@ -1,0 +1,98 @@
+#!/usr/bin/env php
+<?php
+
+// vendor/bin/tenma-discord install: downloads the plugin of this package's version for this machine, checks its
+// SHA-256 and adds it to the project's tenma.json, so `tenma bot.php` loads it.
+
+const RELEASES = 'https://github.com/systonia/Tenma-Discord/releases/download';
+
+if (($argv[1] ?? '') !== 'install') {
+    fwrite(STDERR, "Usage: tenma-discord install\n");
+    exit(2);
+}
+
+foreach ([$_composer_autoload_path ?? null, __DIR__ . '/../vendor/autoload.php'] as $autoload) {
+    if (is_string($autoload) && is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+$version = ltrim(Composer\InstalledVersions::getPrettyVersion('tenma/discord') ?? '', 'v');
+if (!preg_match('/^\d+\.\d+\.\d+$/', $version)) {
+    fail("tenma/discord $version is no release. Build the plugin instead: cd plugin && cargo build --release");
+}
+
+$platform = match ([PHP_OS_FAMILY, php_uname('m')]) {
+    ['Darwin', 'arm64'] => 'macos-arm64.dylib',
+    ['Linux', 'x86_64'] => 'linux-x64.so',
+    ['Linux', 'aarch64'], ['Linux', 'arm64'] => 'linux-arm64.so',
+    default => fail('No plugin for ' . PHP_OS_FAMILY . ' ' . php_uname('m') . '. Build it: cd plugin && cargo build --release'),
+};
+$asset = "tenma-discord-$platform";
+
+echo "Downloading $asset $version\n";
+$plugin = download(RELEASES . "/v$version/$asset");
+
+// The checksums come from the same release: they catch a broken download, not a forged release
+$sums = download(RELEASES . "/v$version/SHA256SUMS");
+if (!preg_match('/^([0-9a-f]{64})\s+' . preg_quote($asset, '/') . '$/m', $sums, $match)) {
+    fail("SHA256SUMS of $version does not list $asset");
+}
+if (!hash_equals($match[1], hash('sha256', $plugin))) {
+    fail("$asset does not match its SHA-256; nothing was installed");
+}
+
+// Next to the package, so a `composer update` to another version drops the old plugin with it
+$target = dirname(__DIR__) . '/lib/libtenma_discord.' . pathinfo($asset, PATHINFO_EXTENSION);
+@mkdir(dirname($target));
+file_put_contents($target, $plugin) !== false || fail("Cannot write $target");
+echo "Installed $target\n";
+
+register(getcwd() . '/tenma.json', $target);
+
+function download(string $url): string
+{
+    $context = stream_context_create(['http' => ['user_agent' => 'tenma-discord-installer', 'ignore_errors' => true]]);
+    $body = @file_get_contents($url, false, $context);
+
+    // The headers of every redirect come first: the last status line is the answer's
+    $status = 0;
+    foreach (http_get_last_response_headers() ?? [] as $header) {
+        if (preg_match('/^HTTP\/\S+ (\d{3})/', $header, $match)) {
+            $status = (int) $match[1];
+        }
+    }
+    if ($body === false || $status !== 200) {
+        fail("Download failed ($status): $url");
+    }
+
+    return $body;
+}
+
+/** Adds the plugin to tenma.json's plugins, with a path from the file's directory as tenma reads it. */
+function register(string $config, string $plugin): void
+{
+    $settings = is_file($config) ? json_decode((string) file_get_contents($config), true) : [];
+    if (!is_array($settings)) {
+        fail("$config is no JSON object");
+    }
+
+    $plugin = (string) realpath($plugin);
+    $directory = realpath(dirname($config)) . '/';
+    $path = str_starts_with($plugin, $directory) ? './' . substr($plugin, strlen($directory)) : $plugin;
+    $plugins = is_array($settings['plugins'] ?? null) ? $settings['plugins'] : [];
+    if (in_array($path, $plugins, true)) {
+        return;
+    }
+    $settings['plugins'] = [...$plugins, $path];
+
+    file_put_contents($config, json_encode($settings, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+    echo "Added $path to $config\n";
+}
+
+function fail(string $message): never
+{
+    fwrite(STDERR, "$message\n");
+    exit(1);
+}

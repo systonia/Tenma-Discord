@@ -7,3 +7,4 @@ parameters:
         - src
         - tests
         - examples
+        - bin/tenma-discord

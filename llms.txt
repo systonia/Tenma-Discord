@@ -1,0 +1,54 @@
+# tenma/discord
+
+> Discord bots in PHP 8.5 on Tenma. A native plugin holds the gateway, REST and voice connections; PHP registers commands, buttons, modals and event handlers on `Tenma\Discord\Bot` and calls `start()`. Install with `composer require tenma/discord` and `vendor/bin/tenma-discord install` (downloads the plugin and adds it to `tenma.json`), run with `DISCORD_TOKEN=... tenma bot.php`.
+
+```php
+use Tenma\Discord\{Bot, Button, Message, Option};
+use Tenma\Discord\Interactions\{Click, Command};
+
+$bot = new Bot(getenv('DISCORD_TOKEN'));
+
+$bot->command('radio', 'Plays a station', function (Command $command) use ($bot) {
+    if ($command->voiceChannel === null) {
+        return new Message('Join a voice channel first.', ephemeral: true);
+    }
+    $command->defer();   // joining takes longer than the 3 seconds Discord waits
+    $bot->voice($command->guildId)->join($command->voiceChannel)->play($command->string('url') ?? 'https://listen.moe/stream');
+
+    return new Message('On air', buttons: [new Button('leave', 'Leave')]);
+}, [Option::string('url', 'Stream URL')]);
+
+$bot->button('leave', function (Click $click) use ($bot) {
+    $bot->voice($click->guildId)->leave();
+    $click->update(new Message('Bye', buttons: []));
+});
+
+$bot->start();
+```
+
+Rules:
+
+- A handler's return value is the reply: a string or a `Message`; null sends nothing. Discord waits 3 seconds: call `defer()` first for slower work, the return value then replaces the "thinking" message. After the first answer, `reply()` sends a follow-up.
+- `Message(content, embeds, buttons, ephemeral)`: on an edit (`$click->update()`, `edit()`), a null field stays as it was and `[]` clears it. Buttons go five to a row, at most 25.
+- `button('vote', ...)` and `modal('form', ...)` also receive ids that start with `vote:` / `form:`: put data in the id (`new Button("vote:$pollId", 'Yes')`).
+- A modal opens only as the first answer: `$command->modal(...)` or `$click->modal(...)`, never after `defer()`.
+- Commands are global and sync on start, only when their definition changed; a new command may take a moment to show up in Discord.
+- Under `tenma --workers N` every worker runs the script; each gets the events of its share of the guilds (by guild id). Each worker keeps its own memory: shared state belongs in Postgres or Redis.
+- `MessageCreated::$content` needs `Intents::MessageContent`, `MemberJoined` needs `Intents::GuildMembers`: privileged, switched on in the developer portal, passed as `new Bot($token, Intents::Default | Intents::GuildMessages | Intents::MessageContent)`.
+- A handler that throws answers the user "Something went wrong." (ephemeral) and the exception goes on to Tenma's log.
+
+API at a glance:
+
+- `Bot`: `command(name, description, handler, options)`, `button(id, handler)`, `modal(id, handler)`, `on(EventClass::class, handler)`, `voice(guildId)`, `voiceChannel(guildId, userId)`, `rest`, `start()`.
+- `Option`: `string`, `integer`, `number` (each with `autocomplete:`), `boolean`, `user`, `channel`; `required:`.
+- `Interactions\Command`: `name`, `option(name)`, `string(name)`, `integer(name)`; every interaction has `id`, `guildId`, `channelId`, `user`, `voiceChannel`, `reply()`, `defer()`, `followUp()`, `edit()`, `modal()`. `Click`: `buttonId`, `messageId`, `update()`. `Submit`: `modalId`, `value(id)`. `Autocomplete`: `command`, `option`, `value`; its handler returns values or names => values (25 at most).
+- `Message`, `Embed(title, description, url, color, fields, image, footer)`, `Button(id, label, style, url, disabled)` and `Button::link()`, `ButtonStyle`, `Modal(id, title, fields)`, `TextInput(id, label, paragraph, required, value, placeholder, maxLength)`.
+- `Events\`: `Ready`, `GuildCreated`, `MessageCreated` (with `reply()`), `VoiceStateUpdated`, `MemberJoined`, `TrackStarted`, `TrackEnded`, `TrackFailed`, and `Dispatch` (type and raw data) for every event.
+- `Voice`: `join(channelId)`, `play(url)` (replaces), `queue(url)`, `skip()`, `pause()`, `resume()`, `stop()` (empties the queue), `mute(bool)`, `tracks()`, `leave()`. Plays streams, MP3, Ogg and AAC over HTTP.
+- `Rest`: `request(method, path, body)` returns a `Payload` for any Discord API route; `send(channelId, message)` returns the message id.
+
+Links:
+
+- [README](https://github.com/systonia/Tenma-Discord/blob/main/README.md)
+- [Example radio bot](https://github.com/systonia/Tenma-Discord/blob/main/examples/radio.php)
+- [Tenma](https://github.com/systonia/Tenma/blob/main/llms.txt)
