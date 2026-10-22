@@ -1,0 +1,5 @@
+.env
+/plugin/target/
+/vendor/
+composer.lock
+.phpunit.cache/
