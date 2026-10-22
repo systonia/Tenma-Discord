@@ -1,0 +1,13 @@
+* text=auto
+
+# Left out of Composer installs; src/, bin/, README, llms.txt and licenses ship.
+# The native plugin comes prebuilt from the GitHub release (bin/tenma-discord install).
+/plugin                export-ignore
+/examples              export-ignore
+/tests                 export-ignore
+/.github               export-ignore
+/phpunit.xml           export-ignore
+/phpstan.neon          export-ignore
+/cliff.toml            export-ignore
+/.gitattributes        export-ignore
+/.gitignore            export-ignore
